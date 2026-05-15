@@ -6,4 +6,5 @@ Pillow
 numpy
 PyMuPDF
 openpyxl
+python-docx
 
