@@ -1,0 +1,9 @@
+# Add project dependencies here, one per line.
+pywin32
+pywinauto
+pyautogui
+Pillow
+numpy
+PyMuPDF
+openpyxl
+
