@@ -5,8 +5,6 @@ makeRecipt - Automatic Hebrew Receipt Generator
 
 import os
 import re
-import subprocess
-import sys
 import time
 from datetime import datetime
 
@@ -376,13 +374,9 @@ def main():
         print(f"✓  PDF saved:      {pdf_path}"); doc.Close(False)
 
         if os.path.exists(FOXIT_PATH):
-            # Run the working signature script, passing the PDF path as argument
-            sig_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                      'place_sig_once.py')
+            from place_sig_once import apply_signature
             print("\nApplying signature...")
-            result = subprocess.run([sys.executable, sig_script, pdf_path])
-            if result.returncode != 0:
-                print("  ⚠  Signature script exited with an error.")
+            apply_signature(pdf_path, log_fn=print)
         else:
             print(f"  ⚠  Foxit not found at: {FOXIT_PATH}")
 

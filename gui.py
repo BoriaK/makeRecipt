@@ -6,7 +6,6 @@ Launch with:  python gui.py
 
 import os
 import re
-import subprocess
 import sys
 import threading
 from datetime import datetime
@@ -108,11 +107,9 @@ def _produce_receipt(month_he: str, amount: str, new_num: int, log_fn):
     if not os.path.exists(FOXIT_PATH):
         raise RuntimeError(f'Foxit not found:\n  {FOXIT_PATH}')
 
-    sig_script = os.path.join(_HERE, 'place_sig_once.py')
+    from place_sig_once import apply_signature
     log_fn('Applying signature in Foxit...')
-    result = subprocess.run([sys.executable, sig_script, pdf_path])
-    if result.returncode != 0:
-        raise RuntimeError('Signature script exited with an error.')
+    apply_signature(pdf_path, log_fn=log_fn)
     log_fn('✓  All done!')
 
 
