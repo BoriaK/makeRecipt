@@ -10,6 +10,21 @@ import sys
 import threading
 from datetime import datetime
 
+# Force this process to be per-monitor DPI-aware BEFORE any window is created.
+# Without this, Windows may virtualize/scale coordinates reported by raw win32
+# APIs (GetWindowRect, SetCursorPos, PIL ImageGrab) inconsistently between
+# process launches, while pywinauto's UIA backend always reports true
+# physical pixels — causing click-coordinate math in place_sig_once.py to
+# silently mismatch the live screen. Must be set once, as early as possible.
+import ctypes
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE_V2
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 

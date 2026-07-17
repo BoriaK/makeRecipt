@@ -277,11 +277,37 @@ def apply_signature_in_foxit(pdf_path):
     br    = sig_btn[0].rectangle()
     sig_x = br.left + 80
     sig_y = (br.top + br.bottom) // 2
-    print(f"Signature List rect: ({br.left},{br.top},{br.right},{br.bottom})  clicking at ({sig_x},{sig_y})")
+    print(f"Signature List rect: ({br.left},{br.top},{br.right},{br.bottom})  "
+          f"size={br.right-br.left}x{br.bottom-br.top}  fallback click at ({sig_x},{sig_y})")
 
     # ── 7. Pick up signature + place it ──────────────────────────
-    _raw_click(sig_x, sig_y, pause=1.5)
-    _raw_click(tx,    ty,    pause=1.5)
+    sig_item = None
+    try:
+        for _child in sig_btn[0].children():
+            try:
+                _cr  = _child.rectangle()
+                _txt = _child.window_text().strip()
+                if 'create' in _txt.lower():
+                    continue
+                if _cr.width() < 25 or _cr.height() < 15:
+                    continue
+                sig_item = _child
+                print(f"Signature thumbnail child: '{_txt}' rect=({_cr.left},{_cr.top},{_cr.right},{_cr.bottom})")
+                break
+            except Exception:
+                pass
+    except Exception as _e:
+        print(f"Child search error: {_e}")
+
+    if sig_item:
+        sig_item.click_input()
+        print("Signature thumbnail clicked (child element)")
+    else:
+        sig_x = br.left + (br.right - br.left) // 3
+        print(f"No child found — clicking at left-third ({sig_x},{sig_y})")
+        _raw_click(sig_x, sig_y)
+    time.sleep(1.5)
+    _raw_click(tx, ty, pause=1.5)
 
     # ── 8. Move mouse away (no click, no Escape) ──────────────────
     win32api.SetCursorPos((wl + 150, wt + 300))

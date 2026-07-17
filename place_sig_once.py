@@ -7,19 +7,47 @@ Can be used two ways:
   2. As a script:   python place_sig_once.py [pdf_path]
 """
 import sys, time, os, subprocess
-import fitz
+
+# Force this process to be per-monitor DPI-aware BEFORE any window/screenshot
+# interaction. Without this, win32gui/win32api/PIL ImageGrab coordinates can
+# be virtualized (scaled) inconsistently between separate process launches,
+# while pywinauto's UIA backend always reports true physical pixels — a
+# mismatch that silently corrupts click math. Safe to call even when this
+# module is imported into a process that already set it (e.g. via gui.py);
+# a second call just raises, which is ignored.
+import ctypes
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE_V2
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 import numpy as np
-import cv2
 import win32api, win32con, win32gui
 import pyautogui
 from PIL import ImageGrab
 
 FOXIT = r'C:\Program Files (x86)\Foxit Software\Foxit PDF Editor\FoxitPDFEditor.exe'
 
-SIG_STRIP_Y1 = 580
-SIG_STRIP_Y2 = 650
-SIG_X_PT     = 465.0
-ABOVE_PX     = 10
+# The Word template is always US Letter (8.5in x 11in = 215.9mm wide).
+# Used to calibrate pixels-per-mm from the live screenshot (page white span)
+# so the vertical placement offset is a real physical distance, not a
+# fixed pixel guess that breaks if the window/zoom size ever changes.
+PAGE_WIDTH_MM = 215.9
+
+# Desired gap between the BOTTOM of the placed signature stamp and the
+# underline itself.
+SIG_ABOVE_MM = 1.5
+
+# Empirically observed: Foxit's Fill & Sign anchors the placement click
+# roughly at the stamp's vertical centre rather than its bottom edge, so the
+# stamp's ink extends a few px BELOW wherever we click. Verified via pixel
+# analysis of a placed stamp (debug/stamp_zoom.png): with a 10px click
+# offset, the stamp's ink still reached to within ~4px of the line, i.e. it
+# extended ~6px below the click point.
+_STAMP_OVERHANG_PX = 6
 
 
 def _raw_click(x, y, pause=0.3):
@@ -31,60 +59,92 @@ def _raw_click(x, y, pause=0.3):
     time.sleep(pause)
 
 
-def _find_sigline_target(pdf_path, log, win_rect):
-    """win_rect = (left, top, right, bottom) of the Foxit window."""
-    doc = fitz.open(pdf_path)
-    pix = doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
-    rendered = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-        pix.height, pix.width, pix.n)
-    if pix.n == 4:
-        rendered = rendered[:, :, :3]
-    doc.close()
+def _find_sigline_visual(win_rect, log, min_run=60, max_run=400, ribbon_h=150):
+    """Locate the blank signature underline ('___') by scanning a LIVE
+    screenshot of the Foxit window for a long, isolated horizontal run of
+    dark pixels — the same visual/variance-detector philosophy used to find
+    the signature thumbnail, applied here to the document itself instead of
+    matching against a separately fitz-rendered copy of the PDF (which was
+    prone to scale/DPI mismatches against the live screen).
 
-    strip = rendered[SIG_STRIP_Y1:SIG_STRIP_Y2, :]
-
-    # Screenshot of whatever monitor the Foxit window is on
+    win_rect = (left, top, right, bottom) of the Foxit window.
+    """
     wl, wt, wr, wb = win_rect
-    # Clamp to screen bounds (window may have negative top with chrome)
-    scr_left  = max(0, wl)
-    scr_top   = max(0, wt)
-    scr_right = wr
-    scr_bot   = wb
-    scr = np.array(ImageGrab.grab(bbox=(scr_left, scr_top, scr_right, scr_bot),
-                                   all_screens=True).convert('RGB'))
+    scr_left = max(0, wl)
+    scr_top  = max(0, wt)
+    img = ImageGrab.grab(bbox=(scr_left, scr_top, wr, wb), all_screens=True).convert('L')
+    arr = np.array(img)
+    H, W = arr.shape
 
-    ribbon_h = 150   # skip ribbon rows in the match
-    best = None
-    for scale in np.arange(0.80, 1.40, 0.02):
-        w = int(strip.shape[1] * scale)
-        h = int(strip.shape[0] * scale)
-        if w >= scr.shape[1] or h >= scr.shape[0] - ribbon_h:
+    dark = arr < 150
+    candidates = []
+    for y in range(ribbon_h, H):
+        row = dark[y]
+        if not row.any():
             continue
-        tmpl = cv2.resize(strip, (w, h))
-        res  = cv2.matchTemplate(
-            cv2.cvtColor(scr[ribbon_h:], cv2.COLOR_RGB2GRAY),
-            cv2.cvtColor(tmpl,           cv2.COLOR_RGB2GRAY),
-            cv2.TM_CCOEFF_NORMED)
-        _, val, _, loc = cv2.minMaxLoc(res)
-        if best is None or val > best[0]:
-            # Convert back to absolute screen coords
-            best = (val, scale,
-                    loc[0] + scr_left,
-                    loc[1] + scr_top + ribbon_h,
-                    w, h)
+        idx = np.where(row)[0]
+        splits = np.where(np.diff(idx) > 1)[0]
+        for g in np.split(idx, splits + 1):
+            run_len = int(g[-1] - g[0] + 1)
+            if min_run < run_len < max_run:
+                candidates.append((run_len, int(y), int(g[0]), int(g[-1])))
 
-    val, scale, mx, my, mw, mh = best
-    log(f"Sigline match: confidence={val:.3f}  scale={scale:.2f}")
-    if val < 0.50:
+    if not candidates:
         raise RuntimeError(
-            f"Signature line not found on screen (confidence={val:.3f} < 0.50).")
-    tx = mx + int(SIG_X_PT * 2 * scale)
-    ty = my + mh // 2 - ABOVE_PX
+            "Signature underline not found on screen (no isolated dark run of "
+            f"{min_run}-{max_run}px detected below y={ribbon_h}).")
+
+    # The signature line sits near the end of the document, so prefer the
+    # bottom-most matching run; break ties by longest run length.
+    candidates.sort(key=lambda c: (c[1], c[0]))
+    run_len, y, x0, x1 = candidates[-1]
+    log(f"Underline detected: run={run_len}px  row_y={y}  x=[{x0},{x1}]  "
+        f"(from {len(candidates)} candidate(s))")
+
+    # Calibrate pixels-per-mm from the page's own white horizontal span in
+    # this same row (page background is white; margins/canvas around it are
+    # not), so the vertical offset below is a real ~1mm regardless of window
+    # size, zoom level, or monitor DPI.
+    white_idx = np.where(arr[y] >= 250)[0]
+    if len(white_idx) >= 2:
+        page_px_width = int(white_idx[-1] - white_idx[0] + 1)
+        px_per_mm = page_px_width / PAGE_WIDTH_MM
+    else:
+        px_per_mm = 8.8  # fallback: matches the calibrated 1940-wide window
+    above_px = _STAMP_OVERHANG_PX + round(SIG_ABOVE_MM * px_per_mm)
+    log(f"Calibration: px_per_mm={px_per_mm:.2f}  above_px={above_px}")
+
+    cx = (x0 + x1) // 2
+    tx = scr_left + cx
+    ty = scr_top + y - above_px
     log(f"Target: ({tx},{ty})")
     return tx, ty
 
 
 def apply_signature(pdf_path: str, log_fn=print) -> None:
+    """
+    Public entry point. Wraps _apply_signature_impl so that ANY exception
+    (including ones from pywinauto/win32 that aren't explicitly raised as
+    RuntimeError) gets its full traceback written to debug/run_log.txt
+    before propagating — this lets us diagnose failures after the fact
+    without needing a live console.
+    """
+    try:
+        return _apply_signature_impl(pdf_path, log_fn)
+    except Exception:
+        import traceback
+        _tb = traceback.format_exc()
+        try:
+            _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'debug', 'run_log.txt')
+            os.makedirs(os.path.dirname(_p), exist_ok=True)
+            with open(_p, 'a', encoding='utf-8') as _f:
+                _f.write(_tb + "\n")
+        except Exception:
+            pass
+        raise
+
+
+def _apply_signature_impl(pdf_path: str, log_fn=print) -> None:
     """
     Open *pdf_path* in Foxit, place the saved Fill & Sign signature on the
     שם וחתימה line, apply all signatures, save and close Foxit.
@@ -93,6 +153,22 @@ def apply_signature(pdf_path: str, log_fn=print) -> None:
     log_fn is called with progress strings (safe to pass a GUI logger).
     """
     import pywinauto
+    from datetime import datetime as _dt
+
+    _debug_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'debug')
+    os.makedirs(_debug_dir, exist_ok=True)
+    _log_path   = os.path.join(_debug_dir, 'run_log.txt')
+    _user_log   = log_fn
+
+    def log_fn(msg):  # noqa: F811 - intentional shadow, wraps user log_fn with file logging
+        try:
+            with open(_log_path, 'a', encoding='utf-8') as _f:
+                _f.write(f"[{_dt.now():%H:%M:%S}] {msg}\n")
+        except Exception:
+            pass
+        _user_log(msg)
+
+    log_fn("="*20 + " apply_signature start " + "="*20)
 
     # ── 0. Open the PDF ───────────────────────────────────────────
     log_fn(f"Opening {os.path.basename(pdf_path)} ...")
@@ -179,10 +255,10 @@ def apply_signature(pdf_path: str, log_fn=print) -> None:
     time.sleep(0.5)
     log_fn("Scrolled to document top")
 
-    # ── 4. Template-match signature line ─────────────────────────
-    tx, ty = _find_sigline_target(pdf_path, log_fn, (wl, wt, wr, wb))
-
-    # ── 5. Click Fill & Sign ──────────────────────────────────────
+    # ── 4. Click Fill & Sign ──────────────────────────────────────
+    # NOTE: this must happen BEFORE sigline template matching. The Fill & Sign
+    # ribbon adds an extra thumbnail-strip row that pushes the whole document
+    # viewport down, so any target coordinates computed beforehand go stale.
     win32gui.BringWindowToTop(hwnd)
     time.sleep(0.3)
     win = app.top_window()
@@ -201,7 +277,7 @@ def apply_signature(pdf_path: str, log_fn=print) -> None:
         log_fn(f"Fill & Sign button clicked: [{btn[0].window_text()}]")
     time.sleep(2.0)
 
-    # ── 6. Find Signature List button ─────────────────────────────
+    # ── 5. Find Signature List button ─────────────────────────────
     sig_btn = None
     for attempt in range(8):
         win = app.top_window()
@@ -215,27 +291,92 @@ def apply_signature(pdf_path: str, log_fn=print) -> None:
         raise RuntimeError("'Signature List' button not found via UIA after 8 s")
 
     br    = sig_btn[0].rectangle()
-    sig_x = br.left + 80
-    sig_y = (br.top + br.bottom) // 2
-    log_fn(f"Signature List rect: ({br.left},{br.top},{br.right},{br.bottom})  clicking thumbnail at ({sig_x},{sig_y})")
+    log_fn(f"Signature List rect: ({br.left},{br.top},{br.right},{br.bottom})  "
+           f"size={br.right - br.left}x{br.bottom - br.top}")
 
-    # ── 7. Pick up signature + place it ──────────────────────────
+    # ── 7. Click the signature thumbnail ──────────────────────────
+    # Confirmed via live diagnostic testing: the ink thumbnail sits in the
+    # LEFT portion of the 'Signature List' container (roughly the first
+    # fifth of its width), well clear of the wider 'Create Signature' (+)
+    # button further right. Clicking the container's centre or relying on
+    # a narrower sub-region anchored off the (unreliable) 'Create Signature'
+    # button edge both missed the thumbnail in earlier attempts.
     win32gui.BringWindowToTop(hwnd)
     time.sleep(0.3)
-    _raw_click(sig_x, sig_y, pause=2.0)   # click thumbnail — sig attaches to cursor
-    log_fn(f"Signature thumbnail clicked — now placing at ({tx},{ty})")
+
+    _click_x = br.left + int((br.right - br.left) * 0.20)
+    _click_y = (br.top + br.bottom) // 2
+    log_fn(f"Clicking thumbnail at ({_click_x},{_click_y})")
+    # Use pyautogui (real interpolated mouse movement) instead of an instant
+    # SetCursorPos jump. Foxit's Fill & Sign attaches a floating signature
+    # preview to the cursor after this click; some Foxit builds only update
+    # that internal "attached" state correctly when they actually receive
+    # WM_MOUSEMOVE events en route, not just a teleport + click.
+    pyautogui.moveTo(_click_x, _click_y, duration=0.25)
+    time.sleep(0.2)
+    pyautogui.click()
+    time.sleep(2.0)
+    log_fn("Signature thumbnail clicked")
+
+    # ── Re-detect signature line NOW, with the Fill & Sign ribbon (and its
+    # extra thumbnail-strip row) already in its final, settled state. Doing
+    # this earlier (before the ribbon changed size) produced stale coordinates
+    # that missed the dotted line entirely.
+    win = app.top_window()
+    wl2, wt2, wr2, wb2 = win32gui.GetWindowRect(hwnd)
+    tx, ty = _find_sigline_visual((wl2, wt2, wr2, wb2), log_fn)
 
     # Save debug screenshot to confirm what's on screen before placement
     _dbg = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'debug', 'before_place_new.png')
     os.makedirs(os.path.dirname(_dbg), exist_ok=True)
-    ImageGrab.grab(bbox=(max(0,wl), max(0,wt), wr, wb), all_screens=True).save(_dbg)
+    ImageGrab.grab(bbox=(max(0,wl2), max(0,wt2), wr2, wb2), all_screens=True).save(_dbg)
     log_fn(f"Debug screenshot saved: {_dbg}")
 
-    _raw_click(tx, ty, pause=1.5)          # stamp on document
+    # Move smoothly onto the document (generates real WM_MOUSEMOVE events so
+    # Foxit's floating signature preview tracks the cursor and is actually
+    # "hovering" at this spot when the click commits), then click to stamp.
+    pyautogui.moveTo(tx, ty, duration=0.3)
+    time.sleep(0.3)
+    pyautogui.click()
+    time.sleep(1.5)
     log_fn("Signature placed")
 
+    # Verify visually: did anything actually change at the target spot?
+    _after_place = os.path.join(_debug_dir, 'after_place_click.png')
+    ImageGrab.grab(bbox=(max(0,wl2), max(0,wt2), wr2, wb2), all_screens=True).save(_after_place)
+    log_fn(f"Debug screenshot saved: {_after_place}")
+
+    # Check whether the click-to-place actually attached anything by looking
+    # at 'Apply All Signatures' enabled state. If it's still disabled, retry
+    # with a real drag-and-drop gesture (mouse down on thumbnail, move while
+    # held, mouse up on the target) — some Foxit builds only accept placement
+    # via drag rather than click-then-click.
+    win = app.top_window()
+    _apply_check = [b for b in win.descendants(control_type='Button')
+                    if b.window_text() == 'Apply All Signatures']
+    _still_disabled = True
+    if _apply_check:
+        try:
+            _still_disabled = not _apply_check[0].is_enabled()
+        except Exception:
+            _still_disabled = True
+    if _still_disabled:
+        log_fn("Click-to-place did not attach — retrying via drag-and-drop")
+        pyautogui.moveTo(_click_x, _click_y, duration=0.2)
+        time.sleep(0.2)
+        pyautogui.mouseDown()
+        time.sleep(0.2)
+        pyautogui.moveTo(tx, ty, duration=0.5)
+        time.sleep(0.2)
+        pyautogui.mouseUp()
+        time.sleep(1.5)
+        log_fn("Drag-and-drop placement attempted")
+        _after_drag = os.path.join(_debug_dir, 'after_drag_place.png')
+        ImageGrab.grab(bbox=(max(0,wl2), max(0,wt2), wr2, wb2), all_screens=True).save(_after_drag)
+        log_fn(f"Debug screenshot saved: {_after_drag}")
+
     # ── 8. Move mouse away ────────────────────────────────────────
-    win32api.SetCursorPos((wl + 150, wt + 300))
+    win32api.SetCursorPos((wl2 + 150, wt2 + 300))
     time.sleep(0.5)
 
     # ── 9. Apply All Signatures ───────────────────────────────────
@@ -244,25 +385,51 @@ def apply_signature(pdf_path: str, log_fn=print) -> None:
                  if b.window_text() == 'Apply All Signatures']
     if not apply_btn:
         raise RuntimeError("'Apply All Signatures' button not found via UIA")
+    try:
+        _enabled = apply_btn[0].is_enabled()
+    except Exception:
+        _enabled = None
+    log_fn(f"'Apply All Signatures' enabled={_enabled}")
+    if _enabled is False:
+        log_fn("  ⚠ WARNING: button appears DISABLED — the signature was likely "
+               "NOT placed (click at (%d,%d) missed the document)" % (tx, ty))
     er = apply_btn[0].rectangle()
     _raw_click((er.left + er.right) // 2, (er.top + er.bottom) // 2)
     time.sleep(2.0)
     log_fn("Apply All Signatures clicked")
+
+    _after_apply = os.path.join(_debug_dir, 'after_apply_click.png')
+    ImageGrab.grab(bbox=(max(0,wl2), max(0,wt2), wr2, wb2), all_screens=True).save(_after_apply)
+    log_fn(f"Debug screenshot saved: {_after_apply}")
 
     # ── 10. Save ──────────────────────────────────────────────────
     win32gui.BringWindowToTop(hwnd)
     time.sleep(0.3)
     pyautogui.hotkey('ctrl', 's')
     time.sleep(2.0)
-    # Only dismiss a dialog if one actually appeared — never send Enter to the document
+    # Only dismiss a dialog if one actually appeared — never send Enter to the document.
+    # Log the dialog's text first so an unexpected dialog (e.g. Save As, permission
+    # error) is visible in run_log.txt instead of being silently dismissed.
     try:
         dlg = app.window(class_name='#32770', top_level_only=True)
         if dlg.exists(timeout=1):
+            try:
+                _dlg_texts = [w.window_text() for w in dlg.descendants()
+                              if w.window_text().strip()]
+                log_fn(f"Dialog appeared after Ctrl+S: {_dlg_texts}")
+            except Exception:
+                pass
             dlg.type_keys('{ENTER}')
             time.sleep(1.0)
-    except Exception:
-        pass
+        else:
+            log_fn("No dialog appeared after Ctrl+S (saved silently)")
+    except Exception as _e:
+        log_fn(f"Save-dialog check error: {_e}")
     log_fn("Saved")
+
+    _after_save = os.path.join(_debug_dir, 'after_save.png')
+    ImageGrab.grab(bbox=(max(0,wl2), max(0,wt2), wr2, wb2), all_screens=True).save(_after_save)
+    log_fn(f"Debug screenshot saved: {_after_save}")
 
     # ── 11. Close Foxit ───────────────────────────────────────────
     pyautogui.hotkey('alt', 'f4')
