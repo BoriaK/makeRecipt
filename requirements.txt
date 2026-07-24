@@ -8,3 +8,7 @@ PyMuPDF
 openpyxl
 python-docx
 
+# New direct-PDF-generation flow (see main.py "NEW FLOW" section)
+reportlab
+python-bidi
+

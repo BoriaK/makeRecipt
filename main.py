@@ -14,6 +14,14 @@ import numpy as np
 import pyautogui
 import win32api, win32con, win32gui
 from PIL import ImageGrab
+from PIL import Image as PILImage
+
+# ── NEW FLOW imports (direct PDF generation — no Word, no Foxit) ────────────
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.pdfbase import pdfmetrics as rl_pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont as RLTTFont
+from bidi.algorithm import get_display as bidi_get_display
 
 TEMPLATE_PATH     = r"C:\Users\Administrator\Documents\קבלות_על_אימונים\example_receipt.docx"
 OUTPUT_FOLDER     = r"C:\Users\Administrator\Documents\קבלות_על_אימונים"
@@ -30,6 +38,21 @@ HEBREW_MONTHS: dict[str, str] = {
     "ספטמבר":"September","אוקטובר":"October","נובמבר":"November","דצמבר":"December",
 }
 SUM_LABEL_ALTERNATIVES = [SUM_LABEL, 'סה"כ', "סה''כ", "לתשלום"]
+
+# ── NEW FLOW constants (direct-PDF generator; independent of the .docx
+# template used by the current flow above) ──────────────────────────────────
+ASSETS_DIR           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+SIGNATURE_IMAGE_PATH = os.path.join(ASSETS_DIR, "signature.png")
+
+BUSINESS_NAME    = "בוריס קופצ'ה"
+BUSINESS_ID      = "310577911"
+BUSINESS_ADDRESS = "המרי 39, גבעתיים"
+BUSINESS_PHONE   = "0545676236"
+CLIENT_NAME      = "קוצ'ינג אין מושן"
+PAYMENT_METHOD   = "העברה בנקאית"
+CURRENCY_SYMBOL  = "₪"
+
+_RECEIPT_FILENAME_RE = re.compile(r"^recipt_(\d+)_")
 
 _SIG_STRIP_Y1 = 580
 _SIG_STRIP_Y2 = 650
@@ -413,6 +436,114 @@ def main():
         except: pass
 
     print("\n✓  All done!")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW FLOW — direct PDF generation, no Word, no Foxit, no UI automation.
+# Everything above this line is the CURRENT flow and is left untouched.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_next_receipt_number() -> int:
+    """NEW FLOW: scan OUTPUT_FOLDER for 'recipt_<N>_...pdf' files (the same
+    naming convention the current flow already uses) and return the highest
+    N + 1, or 1 if none exist yet. Independent of the .docx-based reader
+    (_read_next_receipt_num in gui.py) used by the current flow."""
+    if not os.path.isdir(OUTPUT_FOLDER):
+        return 1
+    best = 0
+    for name in os.listdir(OUTPUT_FOLDER):
+        m = _RECEIPT_FILENAME_RE.match(name)
+        if m:
+            best = max(best, int(m.group(1)))
+    return best + 1
+
+
+def _register_new_flow_fonts():
+    """NEW FLOW: register Hebrew-capable Arial TTFs with reportlab, once."""
+    if "Arial-NewFlow" in rl_pdfmetrics.getRegisteredFontNames():
+        return
+    rl_pdfmetrics.registerFont(RLTTFont("Arial-NewFlow", r"C:\Windows\Fonts\arial.ttf"))
+    rl_pdfmetrics.registerFont(RLTTFont("Arial-NewFlow-Bold", r"C:\Windows\Fonts\arialbd.ttf"))
+
+
+def generate_receipt_pdf(receipt_num, month_he: str, amount: str, output_path: str) -> str:
+    """
+    NEW FLOW: draw a complete, already-signed receipt PDF from scratch.
+
+    No Word template, no Foxit, no screen/UI automation. The signature
+    underline's position is fully known by construction (this function is
+    the one that draws it), so the saved signature image is simply pasted
+    right above it — no detection step is required.
+    """
+    _register_new_flow_fonts()
+
+    today = datetime.now()
+    date_str = today.strftime("%d/%m/%Y")
+    year = today.year
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+    c = rl_canvas.Canvas(output_path, pagesize=letter)
+    page_w, page_h = letter
+
+    right_x = page_w - 72   # right margin anchor (1 inch)
+    y = page_h - 90         # top margin start
+
+    def draw_line(text, bold=False, size=11, gap_after=20):
+        nonlocal y
+        font = "Arial-NewFlow-Bold" if bold else "Arial-NewFlow"
+        c.setFont(font, size)
+        c.drawRightString(right_x, y, bidi_get_display(text))
+        y -= gap_after
+
+    draw_line(f"קבלה מספר {receipt_num}", bold=True, size=14, gap_after=22)
+    draw_line(f"תאריך: {date_str}", size=11, gap_after=30)
+
+    draw_line("פרטי העסק:", bold=True, size=12, gap_after=18)
+    draw_line(f"שם העסק: {BUSINESS_NAME}", gap_after=18)
+    draw_line(f"מס' עוסק: {BUSINESS_ID}", gap_after=18)
+    draw_line(f"כתובת: {BUSINESS_ADDRESS}", gap_after=18)
+    draw_line(f"טלפון: {BUSINESS_PHONE}", gap_after=30)
+
+    draw_line("פרטי הלקוח:", bold=True, size=12, gap_after=18)
+    draw_line(f"שם הלקוח: {CLIENT_NAME}", gap_after=30)
+
+    draw_line("תיאור השירות:", bold=True, size=12, gap_after=18)
+    draw_line(f"אימוני ג'יו ג'יטסו במהלך חודש {month_he} {year}", gap_after=30)
+
+    draw_line(f'סכום: {amount} {CURRENCY_SYMBOL} (ללא מע"מ)', gap_after=30)
+
+    draw_line(f"אופן התשלום :{PAYMENT_METHOD}", gap_after=50)
+
+    # ── Signature line + stamp ──────────────────────────────────────────
+    label = "שם וחתימה :"
+    label_font, label_size = "Arial-NewFlow", 11
+    c.setFont(label_font, label_size)
+    label_w = c.stringWidth(bidi_get_display(label), label_font, label_size)
+    c.drawRightString(right_x, y, bidi_get_display(label))
+
+    line_gap   = 6
+    line_width = 140
+    line_x2 = right_x - label_w - line_gap   # line's right end
+    line_x1 = line_x2 - line_width           # line's left end
+    line_y  = y - 3
+    c.setLineWidth(0.75)
+    c.line(line_x1, line_y, line_x2, line_y)
+
+    if os.path.exists(SIGNATURE_IMAGE_PATH):
+        sig_w_px, sig_h_px = PILImage.open(SIGNATURE_IMAGE_PATH).size
+        draw_h = 26
+        draw_w = draw_h * sig_w_px / sig_h_px
+        draw_x = line_x1 + (line_width - draw_w) / 2
+        draw_y = line_y + 2   # small gap above the line
+        c.drawImage(
+            SIGNATURE_IMAGE_PATH,
+            draw_x, draw_y, width=draw_w, height=draw_h,
+            mask="auto", preserveAspectRatio=True,
+        )
+
+    c.showPage()
+    c.save()
+    return output_path
 
 
 if __name__ == "__main__":

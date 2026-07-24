@@ -40,6 +40,10 @@ from main import (
     _get_amount_from_excel,
 )
 
+# NEW FLOW imports (direct PDF generation — no Word, no Foxit). Kept separate
+# from the current-flow imports above; nothing above this is touched.
+from main import generate_receipt_pdf, get_next_receipt_number
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -128,6 +132,34 @@ def _produce_receipt(month_he: str, amount: str, new_num: int, log_fn):
     log_fn('✓  All done!')
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW FLOW — direct PDF generation, no Word, no Foxit, no UI automation.
+# Separate functions; the current-flow ones above are left untouched.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _refresh_receipt_num_new() -> int:
+    """NEW FLOW: next receipt # from scanning OUTPUT_FOLDER, not the .docx."""
+    return get_next_receipt_number()
+
+
+def _produce_receipt_new(month_he: str, amount: str, new_num: int, log_fn):
+    """
+    NEW FLOW: generate the fully filled-in and signed PDF directly.
+    log_fn(msg) is called with progress messages (safe to call from any thread).
+    """
+    month_en = HEBREW_MONTHS[month_he]
+    year = datetime.now().year
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    pdf_filename = f'recipt_{new_num}_{month_en}_{year}.pdf'
+    pdf_path = os.path.abspath(os.path.join(OUTPUT_FOLDER, pdf_filename))
+
+    log_fn('Generating receipt PDF (direct, no Word/Foxit)...')
+    generate_receipt_pdf(new_num, month_he, amount, pdf_path)
+    log_fn(f'✓  PDF saved: {pdf_filename}')
+    log_fn('✓  All done!')
+
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -142,30 +174,44 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {'padx': 14, 'pady': 7}
 
+        # ── Flow mode toggle (NEW) ───────────────────────────────────────────
+        # Lets you pick between the current flow (Word + Foxit) and the new
+        # flow (direct PDF generation, no Word/Foxit). Both remain fully
+        # available; nothing about the current flow is removed.
+        tk.Label(self, text='Flow:', anchor='w', width=14).grid(
+            row=0, column=0, sticky='w', **pad)
+        self.mode_var = tk.StringVar(value='new')
+        mode_frame = tk.Frame(self)
+        mode_frame.grid(row=0, column=1, sticky='w', **pad)
+        tk.Radiobutton(mode_frame, text='New (direct PDF)', variable=self.mode_var,
+                        value='new', command=self._refresh_receipt_num).pack(side='left')
+        tk.Radiobutton(mode_frame, text='Current (Word + Foxit)', variable=self.mode_var,
+                        value='current', command=self._refresh_receipt_num).pack(side='left')
+
         # ── Month ──────────────────────────────────────────────────────────
         tk.Label(self, text='Month:', anchor='w', width=14).grid(
-            row=0, column=0, sticky='w', **pad)
+            row=1, column=0, sticky='w', **pad)
         self.month_var = tk.StringVar()
         months = list(HEBREW_MONTHS.keys())
         self.month_cb = ttk.Combobox(
             self, textvariable=self.month_var,
             values=months, state='readonly', width=22)
-        self.month_cb.grid(row=0, column=1, sticky='ew', **pad)
+        self.month_cb.grid(row=1, column=1, sticky='ew', **pad)
         self.month_cb.bind('<<ComboboxSelected>>', lambda e: self._on_month_change())
 
         # ── Receipt # ──────────────────────────────────────────────────────
         tk.Label(self, text='Receipt #:', anchor='w', width=14).grid(
-            row=1, column=0, sticky='w', **pad)
+            row=2, column=0, sticky='w', **pad)
         self.num_var = tk.StringVar()
         tk.Entry(self, textvariable=self.num_var, width=24).grid(
-            row=1, column=1, sticky='ew', **pad)
+            row=2, column=1, sticky='ew', **pad)
 
         # ── Amount ─────────────────────────────────────────────────────────
         tk.Label(self, text='Amount:', anchor='w', width=14).grid(
-            row=2, column=0, sticky='w', **pad)
+            row=3, column=0, sticky='w', **pad)
         self.amount_var = tk.StringVar()
         tk.Entry(self, textvariable=self.amount_var, width=24).grid(
-            row=2, column=1, sticky='ew', **pad)
+            row=3, column=1, sticky='ew', **pad)
 
         # ── Button ─────────────────────────────────────────────────────────
         self.btn = tk.Button(
@@ -176,7 +222,7 @@ class App(tk.Tk):
             relief='flat', padx=8, pady=8,
             cursor='hand2',
         )
-        self.btn.grid(row=3, column=0, columnspan=2, pady=12)
+        self.btn.grid(row=4, column=0, columnspan=2, pady=12)
 
         # ── Log ────────────────────────────────────────────────────────────
         self.log = scrolledtext.ScrolledText(
@@ -185,13 +231,16 @@ class App(tk.Tk):
             bg='#1e1e1e', fg='#d4d4d4',
             insertbackground='white',
         )
-        self.log.grid(row=4, column=0, columnspan=2, padx=14, pady=(0, 14))
+        self.log.grid(row=5, column=0, columnspan=2, padx=14, pady=(0, 14))
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
     def _refresh_receipt_num(self):
         try:
-            n = _read_next_receipt_num()
+            if self.mode_var.get() == 'new':
+                n = _refresh_receipt_num_new()
+            else:
+                n = _read_next_receipt_num()
             self.num_var.set(str(n))
         except Exception as e:
             self._log(f'(Could not read receipt #: {e})')
@@ -232,12 +281,16 @@ class App(tk.Tk):
             messagebox.showwarning('Invalid input', 'Receipt # must be a whole number.')
             return
 
+        mode = self.mode_var.get()
         self.btn.config(state='disabled')
-        self._log(f'\n── Receipt #{new_num} | {month_he} | ₪{amount} ──')
+        self._log(f'\n── [{mode}] Receipt #{new_num} | {month_he} | ₪{amount} ──')
 
         def job():
             try:
-                _produce_receipt(month_he, amount, new_num, self._log)
+                if mode == 'new':
+                    _produce_receipt_new(month_he, amount, new_num, self._log)
+                else:
+                    _produce_receipt(month_he, amount, new_num, self._log)
             except Exception as exc:
                 self._log(f'ERROR: {exc}')
             finally:
