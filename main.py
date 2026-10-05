@@ -46,7 +46,7 @@ SIGNATURE_IMAGE_PATH = os.path.join(ASSETS_DIR, "signature.png")
 
 BUSINESS_NAME    = "בוריס קופצ'ה"
 BUSINESS_ID      = "310577911"
-BUSINESS_ADDRESS = "המרי 39, גבעתיים"
+BUSINESS_ADDRESS = "ריינס 58, גבעתיים"
 BUSINESS_PHONE   = "0545676236"
 CLIENT_NAME      = "קוצ'ינג אין מושן"
 PAYMENT_METHOD   = "העברה בנקאית"
